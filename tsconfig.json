@@ -1,0 +1,60 @@
+{
+	"compilerOptions": {
+	  // Target the ES2020 version for JavaScript compatibility
+	  "target": "ES2020",
+
+	  // Module system used in the output, CommonJS for Node.js compatibility
+	  "module": "CommonJS",
+
+	  // Enforce strict type-checking options
+	  "strict": true,
+
+	  // Enables interop between CommonJS and ESModule imports
+	  "esModuleInterop": true,
+
+	  // Skip type checking of declaration files
+	  "skipLibCheck": true,
+
+	  // Generates source maps for debugging
+	  "sourceMap": true,
+
+	  // How modules get resolved (node-style resolution for Node.js)
+	  "moduleResolution": "node",
+
+	  // Allows importing of CommonJS modules with a default import syntax
+	  "allowSyntheticDefaultImports": true,
+
+	  // Allows importing JSON files as modules
+	  "resolveJsonModule": true,
+
+	  // Ensure that all variables have an explicit type, no implicit 'any' allowed
+	  "noImplicitAny": true,
+
+	  // Ensures consistent casing of file names across the project
+	  "forceConsistentCasingInFileNames": true,
+
+	  // Allows JavaScript files to be compiled
+	  "allowJs": true,
+
+	  // Generates corresponding '.d.ts' declaration files for all TypeScript files
+	  "declaration": true,
+
+	  // Generates declaration map files for '.d.ts' files
+	  "declarationMap": true,
+
+	  // Ensure both TypeScript and declaration files are emitted (false would emit only declaration files)
+	  "emitDeclarationOnly": false,
+
+	  // The directory to output compiled JavaScript files
+	  "outDir": "dist",
+
+	  // The root directory of your source code (TypeScript files)
+	  "rootDir": "src"
+	},
+
+	// Include all files in the 'src' directory
+	"include": ["src/**/*"],
+
+	// Exclude node_modules and dist directories from the compilation
+	"exclude": ["node_modules", "dist"]
+  }

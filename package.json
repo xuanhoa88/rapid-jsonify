@@ -1,0 +1,55 @@
+{
+  "name": "rapid-jsonify",
+  "version": "0.0.5",
+  "description": "JSON file utilities for streaming read/write with large number support and locking.",
+  "license": "MIT",
+  "keywords": [
+    "json",
+    "stream",
+    "file",
+    "mutex",
+    "locking",
+    "bigint",
+    "parser",
+    "writer"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/xuanhoa88/rapid-jsonify.git"
+  },
+  "author": "XuanNguyen <xuan.0211@gmail.com>",
+  "engines": {
+    "node": ">=14"
+  },
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "scripts": {
+    "postinstall": "npm run build",
+    "prepare": "npm run build",
+    "build": "tsc --build",
+    "rebuild": "npm run build",
+    "test": "jest",
+    "test:watch": "jest --watchAll",
+    "test:coverage": "jest --coverage",
+    "lint": "eslint **/*.js --no-cache",
+    "lint:fix": "npm run lint -- --fix",
+    "clean": "rimraf dist",
+    "clean:all": "rimraf dist node_modules"
+  },
+  "dependencies": {
+    "rapid-mutex": "0.0.7"
+  },
+  "devDependencies": {
+    "@types/jest": "28.1.3",
+    "@typescript-eslint/eslint-plugin": "6.21.0",
+    "@typescript-eslint/parser": "6.21.0",
+    "eslint": "8.22.0",
+    "eslint-config-prettier": "8.10.0",
+    "eslint-plugin-prettier": "5.2.1",
+    "jest": "28.1.3",
+    "prettier": "3.3.3",
+    "rimraf": "4.4.1",
+    "ts-jest": "28.0.8",
+    "typescript": "4.9.5"
+  }
+}
