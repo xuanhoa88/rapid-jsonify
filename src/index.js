@@ -6,11 +6,6 @@ const { promisify } = require('util');
 
 const pipelineAsync = promisify(pipeline);
 
-const MAX_CACHE_SIZE = 1000;
-const CACHE_TTL = 5 * 60 * 1000; // 5 minutes
-const patternCache = new Map();
-const cacheTimestamps = new Map();
-
 /**
  * Destroy a stream and remove all listeners if possible (cleanup helper).
  * @param {object} stream
@@ -29,42 +24,124 @@ const cleanupStream = stream => {
 };
 
 /**
- * Custom JSON.parse that preserves large integers as strings (using a reviver).
- * @param {string} text
- * @returns {any}
+ * Custom JSON.parse that preserves large integers as BigInt.
+ * Handles integers beyond JavaScript's safe integer range (±2^53-1).
+ *
+ * @param {string} text - JSON string to parse
+ * @param {function} [reviver] - Optional reviver function (will be composed with large int handling)
+ * @returns {any} Parsed object with large integers as BigInt
+ * @throws {SyntaxError} If the text is not valid JSON
+ *
+ * @example
+ * const result = parseJSON('{"id": "12345678901234567890"}');
+ * // result.id will be BigInt(12345678901234567890n)
  */
-const parseJSON = text =>
-  JSON.parse(text, (_key, value) => {
-    if (typeof value === 'string' && /^-?\d{16,}$/.test(value)) return BigInt(value);
-    if (typeof value === 'number' && !Number.isSafeInteger(value)) return value.toString();
-    return value;
-  });
+const parseJSON = (text, reviver) => {
+  if (typeof text !== 'string') {
+    throw new TypeError('First argument must be a string');
+  }
+
+  const largeIntReviver = (key, value) => {
+    // Use utility function to check and convert large integers
+    if (isLargeInteger(value)) {
+      const bigIntValue = toBigIntSafe(value);
+      // Only convert if toBigIntSafe actually returned a BigInt
+      if (typeof bigIntValue === 'bigint') {
+        return bigIntValue;
+      }
+    }
+
+    // Handle unsafe numbers (beyond safe integer range)
+    if (typeof value === 'number' && !Number.isSafeInteger(value)) {
+      // Convert to string to preserve precision
+      return value.toString();
+    }
+
+    // Apply user reviver if provided
+    return typeof reviver === 'function' ? reviver(key, value) : value;
+  };
+
+  return JSON.parse(text, largeIntReviver);
+};
 
 /**
- * Custom JSON.stringify that serializes BigInt and large number strings as strings.
- * Wraps optional replacer.
- * @param {any} value
- * @param {function|Array} [replacer]
- * @param {number|string} [space]
- * @returns {string}
+ * Custom JSON.stringify that serializes BigInt and unsafe numbers as strings.
+ * Preserves precision for large integers and handles BigInt serialization.
+ *
+ * @param {any} value - Value to stringify
+ * @param {function|Array|null} [replacer] - Optional replacer function or array
+ * @param {number|string} [space] - Optional spacing for formatting
+ * @returns {string} JSON string with large integers preserved as strings
+ *
+ * @example
+ * const data = { id: BigInt('12345678901234567890'), count: 42 };
+ * const json = stringifyJSON(data);
+ * // Result: '{"id":"12345678901234567890","count":42}'
  */
 const stringifyJSON = (value, replacer, space) => {
   const safeReplacer = (key, val) => {
-    if (typeof val === 'bigint') return val.toString();
-    if (typeof val === 'string' && /^-?\d{16,}$/.test(val)) return val;
-    if (typeof val === 'number' && !Number.isSafeInteger(val)) return val.toString();
-    if (typeof replacer === 'function') return replacer(key, val);
-    if (Array.isArray(replacer)) return replacer.includes(key) ? val : undefined;
+    // Handle BigInt values
+    if (typeof val === 'bigint') {
+      return val.toString();
+    }
+
+    // Handle string representations of large integers (preserve as-is)
+    if (typeof val === 'string' && /^-?\d{16,}$/.test(val)) {
+      return val;
+    }
+
+    // Handle unsafe numbers
+    if (typeof val === 'number' && !Number.isSafeInteger(val)) {
+      return val.toString();
+    }
+
+    // Apply user-provided replacer logic
+    if (typeof replacer === 'function') {
+      return replacer(key, val);
+    }
+
+    // Handle array replacer (whitelist of keys)
+    if (Array.isArray(replacer)) {
+      return replacer.includes(key) ? val : undefined;
+    }
+
     return val;
   };
+
   return JSON.stringify(value, safeReplacer, space);
 };
 
 /**
- * Check if a filesystem entry exists at the given path.
- * @param {string} targetPath
- * @returns {Promise<boolean>}
+ * Utility to check if a value represents a large integer
+ * @param {any} value - Value to check
+ * @returns {boolean} True if value is a large integer (BigInt or string representation)
  */
+const isLargeInteger = value => {
+  if (typeof value === 'bigint') return true;
+  if (typeof value === 'string' && /^-?\d{16,}$/.test(value)) return true;
+  return false;
+};
+
+/**
+ * Safely convert a value to BigInt if it represents a large integer
+ * @param {any} value - Value to convert
+ * @returns {BigInt|any} BigInt if conversion possible, original value otherwise
+ */
+const toBigIntSafe = value => {
+  try {
+    if (typeof value === 'bigint') return value;
+    if (typeof value === 'string' && /^-?\d{16,}$/.test(value)) {
+      return BigInt(value);
+    }
+    if (typeof value === 'number' && Number.isInteger(value)) {
+      return BigInt(value);
+    }
+  } catch (error) {
+    // Conversion failed, return original value
+  }
+  return value;
+};
+
 /**
  * Check if a filesystem entry exists at the given path and return its stat if exists.
  * @param {string} targetPath
@@ -100,54 +177,6 @@ const createDirectory = async directoryPath => {
     if (err.code === 'EEXIST') return true;
     throw err;
   }
-};
-
-/**
- * Pattern matching with cache and expiration cleanup.
- * @param {any} targetPattern
- * @param {any} testValue
- * @returns {boolean}
- */
-const isMatchedPattern = (targetPattern, testValue) => {
-  const cacheKey = `${targetPattern}-${testValue}`;
-  const now = Date.now();
-
-  // Remove expired cache entries
-  for (const [key, timestamp] of cacheTimestamps.entries()) {
-    if (now - timestamp > CACHE_TTL) {
-      patternCache.delete(key);
-      cacheTimestamps.delete(key);
-    }
-  }
-
-  // Cleanup cache if too large
-  if (patternCache.size > MAX_CACHE_SIZE) {
-    const keysToDelete = Array.from(patternCache.keys()).slice(
-      0,
-      patternCache.size - MAX_CACHE_SIZE
-    );
-    for (const key of keysToDelete) {
-      patternCache.delete(key);
-      cacheTimestamps.delete(key);
-    }
-  }
-
-  if (patternCache.has(cacheKey)) {
-    return patternCache.get(cacheKey);
-  }
-
-  let isMatch;
-  if (typeof targetPattern === 'string') isMatch = testValue == targetPattern;
-  else if (targetPattern && typeof targetPattern.exec === 'function')
-    isMatch = !!targetPattern.exec(testValue);
-  else if (typeof targetPattern === 'boolean' || typeof targetPattern === 'object')
-    isMatch = targetPattern;
-  else if (typeof targetPattern === 'function') isMatch = targetPattern(testValue);
-  else isMatch = false;
-
-  patternCache.set(cacheKey, isMatch);
-  cacheTimestamps.set(cacheKey, now);
-  return isMatch;
 };
 
 /**
@@ -545,7 +574,9 @@ const writeJSONFile = async (
             total: data.length,
             percentage: Math.round((Math.min(processed, data.length) / data.length) * 100),
           });
-        } catch {}
+        } catch {
+          // TODO
+        }
       }
     }
 
@@ -627,4 +658,6 @@ async function safeCleanupTempFile(tempFilePath) {
 module.exports = {
   readJSONFile,
   writeJSONFile,
+  parseJSON,
+  stringifyJSON,
 };
