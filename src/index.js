@@ -149,7 +149,7 @@ const toBigIntSafe = value => {
  */
 async function getPathInfo(targetPath) {
   try {
-    if (typeof targetPath !== 'string' || !targetPath.trim()) {
+    if (typeof targetPath !== 'string' || targetPath.trim().length === 0) {
       throw new TypeError('Invalid path');
     }
 
@@ -167,7 +167,7 @@ async function getPathInfo(targetPath) {
  * @returns {Promise<boolean>}
  */
 const createDirectory = async directoryPath => {
-  if (typeof directoryPath !== 'string' || !directoryPath.trim()) {
+  if (typeof directoryPath !== 'string' || directoryPath.trim().length === 0) {
     throw new TypeError('Invalid directory path');
   }
   try {
@@ -180,16 +180,14 @@ const createDirectory = async directoryPath => {
 };
 
 /**
- * Creates a JSON stream parser.
- *
- * Note: This parser expects the input JSON to be chunked into valid JSON objects or arrays.
- * For very large or deeply nested JSON, partial parsing may be incomplete.
+ * Creates a JSON stream parser that can handle various JSON formats.
  *
  * @param {string|Array} pattern - JSONPath pattern or array of keys (e.g. 'foo.bar.*')
  * @param {Function} [transformFn] - Function to transform matched data
  * @returns {Transform} Transform stream emitting matched objects
  */
 const createStreamParser = (pattern = '*', transformFn) => {
+  // Input validation
   if (pattern !== '*' && !Array.isArray(pattern) && typeof pattern !== 'string') {
     throw new TypeError('Pattern must be a string, array, or "*"');
   }
@@ -197,145 +195,262 @@ const createStreamParser = (pattern = '*', transformFn) => {
     throw new TypeError('TransformFn must be a function if provided');
   }
 
-  let isArrayStart, isArrayEnd;
+  // State tracking
   let jsonBuffer = '';
   let bracketDepth = 0;
+  let braceDepth = 0;
   let insideString = false;
   let isEscaped = false;
   let isDestroyed = false;
 
-  // Support patterns like 'users.*' to extract objects at a path
+  // Normalize pattern to array format
   let normalizedPattern = pattern;
-  if (typeof pattern === 'string') {
+  if (typeof pattern === 'string' && pattern !== '*') {
     normalizedPattern = pattern.split('.').map(element => {
-      if (element === '*') return '*';
-      return element;
+      return element === '*' ? '*' : element;
     });
   }
+
   const activePattern =
     Array.isArray(normalizedPattern) && normalizedPattern.length ? normalizedPattern : null;
 
-  const createTransformStream = (write, end, opts = {}) =>
-    new Transform({
-      objectMode: true,
-      transform(chunk, _encoding, callback) {
-        try {
-          write.call(this, chunk);
-          callback();
-        } catch (err) {
-          callback(err);
-        }
-      },
-      flush(callback) {
-        try {
-          if (typeof end === 'function') end.call(this);
-          callback();
-        } catch (err) {
-          callback(err);
-        }
-      },
-      ...opts,
-    });
+  // Helper function to check if we have a complete JSON value
+  const isCompleteJson = () => {
+    return bracketDepth === 0 && braceDepth === 0 && !insideString;
+  };
 
-  // Recursively walk the object to match the pattern
+  // Helper function to try parsing JSON
+  const tryParseJson = str => {
+    const trimmed = str.trim();
+    if (!trimmed) return null;
+
+    try {
+      return JSON.parse(trimmed);
+    } catch (error) {
+      // Check if it might be multiple JSON objects/values separated by whitespace
+      const jsonObjects = [];
+      let currentJson = '';
+      let tempBracketDepth = 0;
+      let tempBraceDepth = 0;
+      let tempInsideString = false;
+      let tempIsEscaped = false;
+
+      for (let i = 0; i < trimmed.length; i++) {
+        const char = trimmed[i];
+
+        if (tempIsEscaped) {
+          tempIsEscaped = false;
+          currentJson += char;
+          continue;
+        }
+
+        if (char === '\\' && tempInsideString) {
+          tempIsEscaped = true;
+          currentJson += char;
+          continue;
+        }
+
+        if (char === '"' && !tempIsEscaped) {
+          tempInsideString = !tempInsideString;
+        }
+
+        if (!tempInsideString) {
+          if (char === '[') tempBracketDepth++;
+          else if (char === ']') tempBracketDepth--;
+          else if (char === '{') tempBraceDepth++;
+          else if (char === '}') tempBraceDepth--;
+        }
+
+        currentJson += char;
+
+        // Check if we have a complete JSON object/array
+        if (
+          tempBracketDepth === 0 &&
+          tempBraceDepth === 0 &&
+          !tempInsideString &&
+          currentJson.trim()
+        ) {
+          try {
+            const parsed = JSON.parse(currentJson.trim());
+            jsonObjects.push(parsed);
+            currentJson = '';
+          } catch (e) {
+            // Continue building the current JSON string
+          }
+        }
+      }
+
+      // Handle any remaining JSON
+      if (currentJson.trim()) {
+        try {
+          const parsed = JSON.parse(currentJson.trim());
+          jsonObjects.push(parsed);
+        } catch (e) {
+          // If we still can't parse, throw the original error
+          throw error;
+        }
+      }
+
+      return jsonObjects.length === 1 ? jsonObjects[0] : jsonObjects;
+    }
+  };
+
+  // Process parsed JSON value according to pattern
   const processValue = jsonValue => {
     if (isDestroyed) return;
-    if (!activePattern) {
-      stream.push(jsonValue);
+
+    // Apply transform function if provided
+    const processedValue = transformFn ? transformFn(jsonValue) : jsonValue;
+
+    if (!activePattern || pattern === '*') {
+      stream.push(processedValue);
       return;
     }
+
+    // Recursively walk the object to match the pattern
     const walk = (obj, patternArr, idx) => {
       if (idx === patternArr.length) {
         // Matched full pattern
-        stream.push(obj);
+        const finalValue = transformFn ? transformFn(obj) : obj;
+        stream.push(finalValue);
         return;
       }
+
       const pat = patternArr[idx];
       if (pat === '*') {
         if (Array.isArray(obj)) {
-          for (const item of obj) walk(item, patternArr, idx + 1);
+          for (const item of obj) {
+            walk(item, patternArr, idx + 1);
+          }
         } else if (typeof obj === 'object' && obj !== null) {
-          for (const key in obj) walk(obj[key], patternArr, idx + 1);
+          for (const key in obj) {
+            if (obj.hasOwnProperty(key)) {
+              walk(obj[key], patternArr, idx + 1);
+            }
+          }
         }
       } else if (typeof obj === 'object' && obj !== null && pat in obj) {
         walk(obj[pat], patternArr, idx + 1);
       }
     };
-    walk(jsonValue, activePattern, 0);
+
+    walk(processedValue, activePattern, 0);
   };
 
-  const stream = createTransformStream(
-    chunk => {
-      if (isDestroyed) return;
+  // Create the transform stream
+  const stream = new Transform({
+    objectMode: true,
+    transform(chunk, _encoding, callback) {
+      if (isDestroyed) {
+        callback();
+        return;
+      }
 
-      const chunkStr = chunk.toString();
-      for (let i = 0; i < chunkStr.length; i++) {
-        const char = chunkStr[i];
+      try {
+        const chunkStr = chunk.toString();
 
-        if (isEscaped) {
-          isEscaped = false;
+        for (let i = 0; i < chunkStr.length; i++) {
+          const char = chunkStr[i];
+
+          // Handle escape sequences
+          if (isEscaped) {
+            isEscaped = false;
+            jsonBuffer += char;
+            continue;
+          }
+
+          if (char === '\\' && insideString) {
+            isEscaped = true;
+            jsonBuffer += char;
+            continue;
+          }
+
+          // Handle string boundaries
+          if (char === '"' && !isEscaped) {
+            insideString = !insideString;
+          }
+
+          // Track bracket/brace depth only outside strings
+          if (!insideString) {
+            if (char === '[') {
+              bracketDepth++;
+            } else if (char === ']') {
+              bracketDepth--;
+            } else if (char === '{') {
+              braceDepth++;
+            } else if (char === '}') {
+              braceDepth--;
+            }
+          }
+
           jsonBuffer += char;
-          continue;
-        }
 
-        if (char === '\\' && insideString) {
-          isEscaped = true;
-          jsonBuffer += char;
-          continue;
-        }
+          // Try to parse when we have a complete JSON structure
+          if (isCompleteJson()) {
+            const parsed = tryParseJson(jsonBuffer);
+            if (parsed !== null) {
+              if (Array.isArray(parsed) && parsed.length > 1) {
+                // Handle multiple JSON objects
+                for (const item of parsed) {
+                  processValue(item);
+                }
+              } else {
+                processValue(parsed);
+              }
+              jsonBuffer = '';
+            }
+          }
 
-        if (char === '"' && !isEscaped) {
-          insideString = !insideString;
-        }
-
-        if (!insideString) {
-          if (char === '{' || char === '[') {
-            bracketDepth++;
-          } else if (char === '}' || char === ']') {
-            bracketDepth--;
+          // Prevent excessive buffer growth
+          if (jsonBuffer.length > 10 * 1024 * 1024) {
+            // 10MB limit
+            this.destroy(new Error('JSON buffer size exceeded 10MB limit'));
+            return;
           }
         }
 
-        jsonBuffer += char;
+        callback();
+      } catch (err) {
+        callback(err);
+      }
+    },
 
-        // Try to parse complete JSON objects
-        if (bracketDepth === 0 && (char === '}' || char === ']')) {
-          try {
-            const value = parseJSON(jsonBuffer);
-            processValue(value);
-            jsonBuffer = '';
-          } catch (err) {
-            // Not a complete JSON object yet, continue buffering
-            if (jsonBuffer.length > 1024 * 1024) {
-              // 1MB buffer limit
-              stream.destroy(new Error('Buffer size exceeded while parsing JSON'));
+    flush(callback) {
+      if (isDestroyed) {
+        callback();
+        return;
+      }
+
+      try {
+        // Process any remaining buffer content
+        if (jsonBuffer.trim()) {
+          const parsed = tryParseJson(jsonBuffer);
+          if (parsed !== null) {
+            if (Array.isArray(parsed) && parsed.length > 1) {
+              for (const item of parsed) {
+                processValue(item);
+              }
+            } else {
+              processValue(parsed);
             }
           }
         }
+        callback();
+      } catch (err) {
+        callback(new Error(`Invalid JSON at end of stream: ${err.message}`));
       }
     },
-    () => {
-      if (isDestroyed) return;
+  });
 
-      if (jsonBuffer.trim()) {
-        try {
-          const value = parseJSON(jsonBuffer);
-          processValue(value);
-        } catch (err) {
-          stream.emit('error', new Error('Invalid JSON at end of stream'));
-        }
-      }
-      if (isArrayStart) stream.emit('isArrayStart', isArrayStart);
-      if (isArrayEnd) stream.emit('isArrayEnd', isArrayEnd);
-      stream.push(null);
-    }
-  );
-
-  // Add cleanup method
+  // Enhanced cleanup method
   const originalDestroy = stream.destroy;
   stream.destroy = function (error) {
     isDestroyed = true;
     jsonBuffer = '';
+    bracketDepth = 0;
+    braceDepth = 0;
+    insideString = false;
+    isEscaped = false;
     originalDestroy.call(this, error);
   };
 
@@ -353,25 +468,21 @@ const createStreamParser = (pattern = '*', transformFn) => {
  * @param {string} [options.encoding='utf8']
  * @param {number} [options.maxBufferSize=1048576]
  * @param {number} [options.maxFileSize=104857600]
- * @returns {Promise<{parsed: Array, raw: string, isFileAccessible: boolean, error: Error}>}
+ * @param {boolean} [options.preserveOriginalType=true] - Whether to return original data type or always array
+ * @returns {Promise<{parsed: Array|Object, raw: string, isFileAccessible: boolean, error: Error}>}
  *
  * @example
- * (async () => {
- *   const { parsed, raw, isFileAccessible, error } = await readJSONFile('./data.json', {
- *     jsonPathPattern: ['users', '*', 'id'], // Example pattern
- *     includeRawData: true,
- *     maxFileSize: 50 * 1024 * 1024, // 50MB max
- *   });
+ * // For a JSON object file: {"name": "John", "age": 30}
+ * const result1 = await readJSONFile('./object.json');
+ * // result1.parsed = {name: "John", age: 30} (object)
  *
- *   if (error) {
- *     console.error('Failed to read JSON:', error);
- *     return;
- *   }
+ * // For a JSON array file: [{"id": 1}, {"id": 2}]
+ * const result2 = await readJSONFile('./array.json');
+ * // result2.parsed = [{id: 1}, {id: 2}] (array)
  *
- *   console.log('Parsed data:', parsed);
- *   console.log('Raw data:', raw);
- *   console.log('File accessible:', isFileAccessible);
- * })();
+ * // Force array return type
+ * const result3 = await readJSONFile('./object.json', { preserveOriginalType: false });
+ * // result3.parsed = [{name: "John", age: 30}] (always array)
  */
 const readJSONFile = async (
   filePath,
@@ -381,11 +492,12 @@ const readJSONFile = async (
     encoding = 'utf8',
     maxBufferSize = 1024 * 1024,
     maxFileSize = 1024 * 1024 * 100,
+    preserveOriginalType = true,
   } = {}
 ) => {
-  const result = { parsed: [], raw: '', isFileAccessible: false, error: null };
+  const result = { parsed: null, raw: '', isFileAccessible: false, error: null };
 
-  // Validate inputs, but do NOT throw — instead set error and return immediately
+  // Validate inputs
   if (typeof filePath !== 'string' || !filePath.trim()) {
     result.error = new TypeError('filePath must be a non-empty string');
     return result;
@@ -403,74 +515,129 @@ const readJSONFile = async (
   let readStream = null;
   let jsonStream = null;
 
+  // Track metadata about the JSON structure
+  let isRootArray = false;
+  let isRootObject = false;
+  let itemCount = 0;
+  let collectedItems = [];
+
   try {
+    // Check file stats
     const stats = await getPathInfo(filePath);
     if (!stats) {
       result.error = new Error(`File not found: ${filePath}`);
       return result;
     }
-    if (stats.size === 0) throw new Error('File is empty');
-    if (stats.size > maxFileSize)
+    if (stats.size === 0) {
+      throw new Error('File is empty');
+    }
+    if (stats.size > maxFileSize) {
       throw new Error(
         `File too large (${(stats.size / 1024 / 1024).toFixed(2)}MB). Max allowed: ${(maxFileSize / 1024 / 1024).toFixed(2)}MB`
       );
+    }
 
     result.isFileAccessible = true;
 
     readStream = fs.createReadStream(filePath, { encoding });
-
     jsonStream = createStreamParser(jsonPathPattern);
 
+    // Collect raw data if needed
     const rawDataChunks = [];
     if (includeRawData) {
       readStream.on('data', chunk => {
         totalBufferSize += chunk.length;
         if (totalBufferSize > maxBufferSize) {
-          readStream.destroy(
-            new Error(`Buffer size exceeded (${(totalBufferSize / 1024 / 1024).toFixed(2)}MB)`)
+          const error = new Error(
+            `Buffer size exceeded (${(totalBufferSize / 1024 / 1024).toFixed(2)}MB)`
           );
+          readStream.destroy(error);
+          return;
         }
         rawDataChunks.push(chunk);
       });
     }
 
+    // Error handling
     readStream.on('error', err => {
       result.error = new Error(`Error reading file: ${err.message}`);
-      readStream.destroy(err);
     });
 
     jsonStream.on('error', err => {
       result.error = new Error(`Error parsing JSON: ${err.message}`);
-      readStream.destroy(err);
     });
 
-    await pipelineAsync(
-      readStream,
-      jsonStream,
-      new Transform({
-        objectMode: true,
-        transform(chunk, _, callback) {
-          try {
-            if (Array.isArray(chunk)) result.parsed.push(...chunk);
-            else result.parsed.push(chunk);
-            callback();
-          } catch (error) {
-            callback(error);
-          }
-        },
-      })
-    );
+    // Create the collection transform stream
+    const collectTransform = new Transform({
+      objectMode: true,
+      transform(chunk, _, callback) {
+        try {
+          itemCount++;
 
+          // Detect the root data type from the first chunk
+          if (itemCount === 1) {
+            // If no pattern is applied (pattern === '*'), we can determine root type
+            if (jsonPathPattern === '*') {
+              isRootArray = Array.isArray(chunk);
+              isRootObject = !isRootArray && typeof chunk === 'object' && chunk !== null;
+            } else {
+              // When using patterns, results are typically extracted values
+              isRootArray = true; // Default to array for pattern results
+            }
+          }
+
+          // Collect the items
+          if (Array.isArray(chunk)) {
+            collectedItems.push(...chunk);
+          } else {
+            collectedItems.push(chunk);
+          }
+
+          callback();
+        } catch (error) {
+          callback(error);
+        }
+      },
+    });
+
+    // Process the stream using callback-based pipeline
+    await pipelineAsync(readStream, jsonStream, collectTransform);
+
+    // Determine the final return type
+    if (preserveOriginalType && jsonPathPattern === '*' && itemCount === 1) {
+      // Return original type when no pattern is applied and we have single root item
+      if (isRootObject && collectedItems.length === 1) {
+        result.parsed = collectedItems[0];
+      } else if (isRootArray) {
+        result.parsed = collectedItems;
+      } else {
+        result.parsed = collectedItems.length === 1 ? collectedItems[0] : collectedItems;
+      }
+    } else {
+      // Return array for pattern matching or when preserveOriginalType is false
+      result.parsed = collectedItems;
+    }
+
+    // Handle empty results
+    if (result.parsed === null || (Array.isArray(result.parsed) && result.parsed.length === 0)) {
+      result.parsed = preserveOriginalType && isRootObject ? {} : [];
+    }
+
+    // Set raw data
     if (includeRawData && rawDataChunks.length) {
       result.raw = rawDataChunks.join('');
     }
   } catch (error) {
     console.error(`Error reading JSON file at ${filePath}:`, error);
     result.error = result.error || error;
+    // Set default parsed value on error
+    result.parsed = preserveOriginalType ? null : [];
   } finally {
+    // Cleanup streams
     cleanupStream(readStream);
     cleanupStream(jsonStream);
   }
+
   return result;
 };
 
@@ -488,7 +655,6 @@ const readJSONFile = async (
  * @param {number} [options.batchSize=1000] - Number of items to process per batch
  * @param {function} [options.replacer] - Optional replacer function for stringifying
  * @param {number} [options.objectChunkThreshold=1000] - Threshold for chunking object properties
- * @param {number} [options.maxStringifySize=50*1024*1024] - Max size for direct stringify (50MB)
  * @param {number} [options.maxListeners=30] - Max number of listeners for the write stream
  * @returns {Promise<{success: boolean, error?: Error}>}
  *
@@ -533,7 +699,6 @@ const writeJSONFile = async (
     replacer,
     maxListeners = 30,
     objectChunkThreshold = 1000,
-    maxStringifySize = 50 * 1024 * 1024, // 50MB
   } = {}
 ) => {
   // Validate inputs, but do NOT throw — instead set error and return immediately
@@ -663,6 +828,7 @@ async function writeChunkedObject(
 
   // Use for...in loop to avoid creating Object.keys() array
   for (const key in data) {
+    // eslint-disable-next-line no-prototype-builtins
     if (!data.hasOwnProperty(key)) continue;
 
     currentChunk.push(key);
