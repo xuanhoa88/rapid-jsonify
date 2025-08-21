@@ -477,47 +477,100 @@ const readJSONFile = async (
 /**
  * Writes data to a JSON file with chunked writing and progress tracking.
  * Atomic write with file locking and directory creation.
+ * Supports both arrays and objects as input data, with special handling for huge objects.
  *
  * @param {string} filePath
- * @param {Array<any>} data
+ * @param {Array<any>|Object} data - Array for chunked processing or Object for direct write
  * @param {Object} options
- * @param {number} [options.chunkSize=100] - Number of items per write chunk (not bytes)
+ * @param {number} [options.chunkSize=100] - Number of items per write chunk (arrays) or properties per chunk (objects)
  * @param {boolean} [options.pretty=false]
- * @param {function} [options.onProgress]
+ * @param {function} [options.onProgress] - Progress callback
  * @param {number} [options.batchSize=1000] - Number of items to process per batch
  * @param {function} [options.replacer] - Optional replacer function for stringifying
- * @returns {Promise<boolean>}
+ * @param {number} [options.objectChunkThreshold=1000] - Threshold for chunking object properties
+ * @param {number} [options.maxStringifySize=50*1024*1024] - Max size for direct stringify (50MB)
+ * @param {number} [options.maxListeners=30] - Max number of listeners for the write stream
+ * @returns {Promise<{success: boolean, error?: Error}>}
  *
  * @example
- * (async () => {
- *   const data = [{ id: 1 }, { id: 2 }, { id: 3 }];
+ * // Array example
+ * const arrayData = [{ id: 1 }, { id: 2 }, { id: 3 }];
+ * const success = await writeJSONFile('./array-output.json', arrayData, {
+ *   chunkSize: 2,
+ *   pretty: true,
+ *   onProgress: ({ processed, total, percentage }) => {
+ *     console.log(`Progress: ${processed}/${total} (${percentage}%)`);
+ *   },
+ * });
  *
- *   const success = await writeJSONFile('./output.json', data, {
- *     chunkSize: 2,
- *     pretty: true,
- *     onProgress: ({ processed, total, percentage }) => {
- *       console.log(`Progress: ${processed}/${total} (${percentage}%)`);
- *     },
- *   });
+ * @example
+ * // Small object example
+ * const objectData = { users: [{ id: 1 }], config: { version: '1.0' } };
+ * const success = await writeJSONFile('./object-output.json', objectData, {
+ *   pretty: true
+ * });
  *
- *   console.log('Write success:', success);
- * })();
+ * @example
+ * // Huge object example
+ * const hugeObject = { // thousands of properties // };
+ * const success = await writeJSONFile('./huge-object.json', hugeObject, {
+ *   pretty: true,
+ *   objectChunkThreshold: 500, // Chunk if more than 500 properties
+ *   chunkSize: 50, // Process 50 properties at a time
+ *   onProgress: ({ processed, total, percentage }) => {
+ *     console.log(`Progress: ${processed}/${total} properties (${percentage}%)`);
+ *   }
+ * });
  */
 const writeJSONFile = async (
   filePath,
   data,
-  { chunkSize = 100, pretty = false, onProgress, batchSize = 1000, replacer } = {}
+  {
+    chunkSize = 100,
+    pretty = false,
+    onProgress,
+    batchSize = 1000,
+    replacer,
+    maxListeners = 30,
+    objectChunkThreshold = 1000,
+    maxStringifySize = 50 * 1024 * 1024, // 50MB
+  } = {}
 ) => {
-  if (typeof filePath !== 'string' || !filePath.trim()) {
+  // Validate inputs, but do NOT throw — instead set error and return immediately
+  if (typeof filePath !== 'string' || filePath.trim().length === 0) {
     return { success: false, error: new TypeError('Invalid file path') };
   }
 
+  // Validate data type
+  if (data === null || data === undefined) {
+    return { success: false, error: new TypeError('Data cannot be null or undefined') };
+  }
+
+  const isArray = Array.isArray(data);
+  const isObject = typeof data === 'object' && !isArray;
+
+  if (!isArray && !isObject) {
+    return { success: false, error: new TypeError('Data must be an array or object') };
+  }
+
+  // Validate options
   if (!Number.isInteger(chunkSize) || chunkSize < 1) {
     return { success: false, error: new RangeError('chunkSize must be a positive integer') };
   }
 
-  if (!Number.isInteger(batchSize) || batchSize < 1) {
+  if (isArray && (!Number.isInteger(batchSize) || batchSize < 1)) {
     return { success: false, error: new RangeError('batchSize must be a positive integer') };
+  }
+
+  if (!Number.isInteger(objectChunkThreshold) || objectChunkThreshold < 1) {
+    return {
+      success: false,
+      error: new RangeError('objectChunkThreshold must be a positive integer'),
+    };
+  }
+
+  if (!Number.isInteger(maxListeners) || maxListeners < 1) {
+    return { success: false, error: new RangeError('maxListeners must be a positive integer') };
   }
 
   const lockHandler = withMutex(filePath);
@@ -526,11 +579,12 @@ const writeJSONFile = async (
   const tempFilePath = filePath + '.tmp';
   let writeStream = null;
   let writeError = null;
+
   try {
     await createDirectory(path.dirname(filePath));
 
     writeStream = fs.createWriteStream(tempFilePath, { encoding: 'utf8' });
-    writeStream.setMaxListeners(30);
+    writeStream.setMaxListeners(maxListeners);
 
     // Capture write errors asynchronously
     const writeErrorPromise = new Promise((_, reject) => {
@@ -540,47 +594,29 @@ const writeJSONFile = async (
       });
     });
 
-    writeStream.write(pretty ? '[\n' : '[');
-
-    let processed = 0;
-    for (let i = 0; i < data.length; i += batchSize) {
-      const batch = data.slice(i, i + batchSize);
-
-      for (let j = 0; j < batch.length; j += chunkSize) {
-        const chunk = batch.slice(j, j + chunkSize);
-        const isLastChunk = i + j + chunk.length >= data.length;
-
-        const jsonChunk = chunk
-          .map(item => stringifyJSON(item, replacer, pretty ? 2 : 0))
-          .join(pretty ? ',\n' : ',');
-
-        const writeData = isLastChunk ? jsonChunk : jsonChunk + ',';
-
-        if (!writeStream.write(writeData)) {
-          await Promise.race([
-            new Promise((resolve, reject) => {
-              writeStream.once('drain', resolve);
-              writeStream.once('error', reject);
-            }),
-            writeErrorPromise,
-          ]);
-        }
-        processed += chunk.length;
-      }
-      if (typeof onProgress === 'function') {
-        try {
-          onProgress({
-            processed: Math.min(processed, data.length),
-            total: data.length,
-            percentage: Math.round((Math.min(processed, data.length) / data.length) * 100),
-          });
-        } catch {
-          // TODO
-        }
-      }
+    // Handle object data
+    if (isObject) {
+      // Large object - use chunked processing
+      await writeChunkedObject(writeStream, data, {
+        chunkSize,
+        pretty,
+        onProgress,
+        replacer,
+        writeErrorPromise,
+      });
+    } else {
+      // Handle array data with chunking (original logic)
+      await writeChunkedArray(writeStream, data, {
+        chunkSize,
+        batchSize,
+        pretty,
+        onProgress,
+        replacer,
+        writeErrorPromise,
+      });
     }
 
-    writeStream.end(pretty ? '\n]\n' : ']');
+    writeStream.end();
 
     await Promise.race([
       new Promise((resolve, reject) => {
@@ -592,7 +628,7 @@ const writeJSONFile = async (
 
     if (writeError) throw writeError;
 
-    // Attempt atomic rename, handle possible cross-device or permission errors
+    // Attempt atomic rename
     const renameResult = await safeRenameTempFile(tempFilePath, filePath);
     if (!renameResult.success) return renameResult;
 
@@ -605,6 +641,202 @@ const writeJSONFile = async (
     await safeCleanupTempFile(tempFilePath);
   }
 };
+
+/**
+ * Writes a chunked object to the stream
+ * @private
+ */
+async function writeChunkedObject(
+  writeStream,
+  data,
+  { chunkSize, pretty, onProgress, replacer, writeErrorPromise }
+) {
+  const indent = pretty ? '  ' : '';
+  const newline = pretty ? '\n' : '';
+  const space = pretty ? ' ' : '';
+
+  writeStream.write(`{${newline}`);
+
+  let processed = 0;
+  let isFirstProperty = true;
+  let currentChunk = [];
+
+  // Use for...in loop to avoid creating Object.keys() array
+  for (const key in data) {
+    if (!data.hasOwnProperty(key)) continue;
+
+    currentChunk.push(key);
+
+    // Process chunk when it reaches the desired size
+    if (currentChunk.length >= chunkSize) {
+      await processObjectChunk(writeStream, data, currentChunk, {
+        isFirstProperty,
+        pretty,
+        replacer,
+        writeErrorPromise,
+        indent,
+        newline,
+        space,
+      });
+
+      processed += currentChunk.length;
+      isFirstProperty = false;
+      currentChunk = [];
+
+      // Progress callback
+      if (typeof onProgress === 'function') {
+        try {
+          onProgress({
+            processed,
+            total: null, // Unknown total for streaming
+            percentage: null, // Cannot calculate percentage without total
+          });
+        } catch {
+          // Ignore progress callback errors
+        }
+      }
+
+      // Allow event loop to breathe
+      await new Promise(resolve => setImmediate(resolve));
+    }
+  }
+
+  // Process remaining properties in the last chunk
+  if (currentChunk.length > 0) {
+    await processObjectChunk(writeStream, data, currentChunk, {
+      isFirstProperty,
+      pretty,
+      replacer,
+      writeErrorPromise,
+      indent,
+      newline,
+      space,
+      isLastChunk: true,
+    });
+
+    processed += currentChunk.length;
+
+    if (typeof onProgress === 'function') {
+      try {
+        onProgress({
+          processed,
+          total: processed, // Final total
+          percentage: 100,
+        });
+      } catch {
+        // Ignore progress callback errors
+      }
+    }
+  }
+
+  writeStream.write(`${newline}}`);
+}
+
+/**
+ * Processes a chunk of object properties
+ * @private
+ */
+async function processObjectChunk(
+  writeStream,
+  data,
+  keyChunk,
+  { isFirstProperty, pretty, replacer, writeErrorPromise, indent, newline, space }
+) {
+  const properties = keyChunk.map((key, index) => {
+    const isFirstInChunk = index === 0 && isFirstProperty;
+
+    const keyStr = stringifyJSON(key, replacer);
+    const valueStr = stringifyJSON(data[key], replacer, pretty ? 2 : 0);
+
+    let property;
+    if (pretty) {
+      const indentedValue = valueStr
+        .split('\n')
+        .map((line, lineIndex) => (lineIndex === 0 ? line : indent + line))
+        .join('\n');
+      property = `${indent}${keyStr}:${space}${indentedValue}`;
+    } else {
+      property = `${keyStr}:${valueStr}`;
+    }
+
+    // Add comma prefix for all properties except the first one
+    if (!isFirstInChunk) {
+      property = ',' + (pretty ? newline : '') + property;
+    }
+
+    return property;
+  });
+
+  const chunkData = properties.join('');
+
+  if (!writeStream.write(chunkData)) {
+    await Promise.race([
+      new Promise((resolve, reject) => {
+        writeStream.once('drain', resolve);
+        writeStream.once('error', reject);
+      }),
+      writeErrorPromise,
+    ]);
+  }
+}
+
+/**
+ * Writes a chunked array to the stream
+ * @private
+ */
+async function writeChunkedArray(
+  writeStream,
+  data,
+  { chunkSize, batchSize, pretty, onProgress, replacer, writeErrorPromise }
+) {
+  writeStream.write(pretty ? '[\n' : '[');
+
+  let processed = 0;
+  for (let i = 0; i < data.length; i += batchSize) {
+    const batch = data.slice(i, i + batchSize);
+
+    for (let j = 0; j < batch.length; j += chunkSize) {
+      const chunk = batch.slice(j, j + chunkSize);
+      const isLastChunk = i + j + chunk.length >= data.length;
+
+      const jsonChunk = chunk
+        .map(item => stringifyJSON(item, replacer, pretty ? 2 : 0))
+        .join(pretty ? ',\n' : ',');
+
+      const writeData = isLastChunk ? jsonChunk : jsonChunk + ',';
+
+      if (!writeStream.write(writeData)) {
+        await Promise.race([
+          new Promise((resolve, reject) => {
+            writeStream.once('drain', resolve);
+            writeStream.once('error', reject);
+          }),
+          writeErrorPromise,
+        ]);
+      }
+      processed += chunk.length;
+    }
+
+    if (typeof onProgress === 'function') {
+      try {
+        onProgress({
+          processed: Math.min(processed, data.length),
+          total: data.length,
+          percentage: Math.round((Math.min(processed, data.length) / data.length) * 100),
+        });
+      } catch {
+        // Ignore progress callback errors
+      }
+    }
+
+    // Allow event loop to breathe
+    if (i % (batchSize * 5) === 0) {
+      await new Promise(resolve => setImmediate(resolve));
+    }
+  }
+
+  writeStream.write(pretty ? '\n]' : ']');
+}
 
 /**
  * Atomically rename a temp file to the target file, cleaning up on failure.
